@@ -3229,6 +3229,998 @@ class TelegramAdapter(BasePlatformAdapter):
             # Catch-all (e.g. page counter button "mx:noop")
             await query.answer()
 
+
+    async def _wr_run(self, *args: str, timeout: float = 30.0) -> tuple[int, str, str]:
+        """Run the safe weekly-review helper script and return rc/stdout/stderr."""
+        proc = await asyncio.create_subprocess_exec(
+            "/mnt/hermes-data/eva/scripts/weekly-review.sh",
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return 124, "", "weekly-review.sh timed out"
+
+        stdout = stdout_b.decode("utf-8", errors="replace").strip()
+        stderr = stderr_b.decode("utf-8", errors="replace").strip()
+        return proc.returncode or 0, stdout, stderr
+
+    def _wr_parse_notes(self, list_output: str) -> list[tuple[int, str]]:
+        """Parse weekly-review.sh list output into numbered note rows."""
+        notes: list[tuple[int, str]] = []
+        for line in (list_output or "").splitlines():
+            line = line.strip()
+            match = re.match(r"^(\d+)\.\s+(.+\.md)$", line)
+            if match:
+                notes.append((int(match.group(1)), match.group(2)))
+        return notes
+
+    def _wr_keyboard(self, notes: list[tuple[int, str]]) -> "InlineKeyboardMarkup":
+        """Build a Telegram inline keyboard for weekly review approvals."""
+        rows = []
+        for idx, _name in notes[:6]:
+            rows.append([
+                InlineKeyboardButton(f"👀 Preview {idx}", callback_data=f"wr:p:{idx}"),
+                InlineKeyboardButton(f"🗄 Deny {idx}", callback_data=f"wr:d:{idx}"),
+            ])
+            rows.append([
+                InlineKeyboardButton(f"✅ Runbook {idx}", callback_data=f"wr:a:{idx}:runbook"),
+                InlineKeyboardButton(f"✅ Decision {idx}", callback_data=f"wr:a:{idx}:decision"),
+            ])
+            rows.append([
+                InlineKeyboardButton(f"✅ Trouble {idx}", callback_data=f"wr:a:{idx}:troubleshooting"),
+                InlineKeyboardButton(f"✅ Daily {idx}", callback_data=f"wr:a:{idx}:daily"),
+            ])
+            rows.append([
+                InlineKeyboardButton(f"✅ Person {idx}", callback_data=f"wr:a:{idx}:person"),
+            ])
+
+        rows.append([
+            InlineKeyboardButton("🔄 Refresh", callback_data="wr:s"),
+            InlineKeyboardButton("📦 Finalize", callback_data="wr:f"),
+        ])
+        return InlineKeyboardMarkup(rows)
+
+    async def _wr_send_or_edit_review(
+        self,
+        *,
+        chat_id: int,
+        message_thread_id: Optional[int] = None,
+        query: Any = None,
+        started: bool = False,
+    ) -> None:
+        """Send or edit the weekly review Telegram message."""
+        if started:
+            await self._wr_run("start", timeout=45.0)
+
+        rc, list_out, list_err = await self._wr_run("list", timeout=20.0)
+        if rc != 0:
+            message = (
+                "🧠 Eva Memory Review\n\n"
+                "I tried to list review notes, but the helper script complained. "
+                "Naturally, the machine chose drama.\n\n"
+                f"{list_err or list_out}"
+            )
+            if query:
+                await query.edit_message_text(text=message, reply_markup=None)
+            else:
+                kwargs = {"chat_id": chat_id, "text": message}
+                if message_thread_id is not None:
+                    kwargs["message_thread_id"] = message_thread_id
+                await self._bot.send_message(**kwargs)
+            return
+
+        notes = self._wr_parse_notes(list_out)
+
+        if not notes:
+            message = (
+                "🧠 Eva Memory Review\n\n"
+                "No notes are waiting for approval right now.\n\n"
+                "The vault is tidy. Suspicious, but welcome."
+            )
+            keyboard = self._wr_keyboard([])
+        else:
+            preview_lines = []
+            for idx, name in notes[:6]:
+                preview_lines.append(f"{idx}. {name}")
+            if len(notes) > 6:
+                preview_lines.append(f"...and {len(notes) - 6} more. Use SSH for the long list, because Telegram has boundaries. Allegedly.")
+
+            message = (
+                "🧠 Eva Memory Review\n\n"
+                f"I found {len(notes)} learned note(s) waiting for your approval.\n\n"
+                + "\n".join(preview_lines)
+                + "\n\nNothing becomes trusted memory until you approve it. "
+                  "I may be useful, but I do not get to grade my own homework."
+            )
+            keyboard = self._wr_keyboard(notes)
+
+        if query:
+            await query.edit_message_text(text=message, reply_markup=keyboard)
+        else:
+            kwargs = {
+                "chat_id": chat_id,
+                "text": message,
+                "reply_markup": keyboard,
+            }
+            if message_thread_id is not None:
+                kwargs["message_thread_id"] = message_thread_id
+            await self._bot.send_message(**kwargs)
+
+    async def _run_eva_helper(self, *args: str, timeout: float = 20.0) -> tuple[int, str, str]:
+        """Run a local Eva helper command safely and return rc/stdout/stderr."""
+        import asyncio
+
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return 124, "", "Command timed out."
+
+        stdout = (stdout_b or b"").decode("utf-8", errors="replace").strip()
+        stderr = (stderr_b or b"").decode("utf-8", errors="replace").strip()
+        return proc.returncode or 0, stdout, stderr
+
+    def _is_custom_commands_question(self, text: str) -> bool:
+        """Detect natural-language requests for Eva's custom command list."""
+        cleaned = (text or "").strip().lower()
+        cleaned = cleaned.replace("?", "").replace("!", "").replace(".", "")
+        cleaned = " ".join(cleaned.split())
+
+        # Friendly typo normalization, because humans type with little meat hammers.
+        cleaned = cleaned.replace("memort", "memory")
+        cleaned = cleaned.replace("memeory", "memory")
+        cleaned = cleaned.replace("remeber", "remember")
+        cleaned = cleaned.replace("rember", "remember")
+
+        phrases = {
+            "what are your custom commands",
+            "what are your custom cammands",
+            "show your custom commands",
+            "show me your custom commands",
+            "list your custom commands",
+            "what custom commands do you have",
+            "what commands do you have",
+            "show commands",
+            "show me commands",
+            "list commands",
+        }
+
+        return cleaned in phrases
+
+    def _is_memory_recall_question(self, text: str) -> bool:
+        """Detect natural-language requests that should search trusted Obsidian memory first."""
+        cleaned = (text or "").strip().lower()
+        cleaned = cleaned.replace("?", "").replace("!", "").replace(".", "")
+        cleaned = " ".join(cleaned.split())
+
+        triggers = [
+            "what do you remember",
+            "do you remember",
+            "what is eva's local memory",
+            "what is eva’s local memory",
+            "what is your local memory",
+            "what is my saved memory",
+            "your local memory test phrase",
+            "my local memory test phrase",
+            "eva local memory test phrase",
+            "eva's local memory test phrase",
+            "eva’s local memory test phrase",
+            "your local test phrase",
+            "my local test phrase",
+            "eva local test phrase",
+            "eva's local test phrase",
+            "eva’s local test phrase",
+            "your test phrase",
+            "my test phrase",
+            "eva test phrase",
+            "eva's test phrase",
+            "eva’s test phrase",
+            "search your memory",
+            "search local memory",
+            "search trusted memory",
+            "search obsidian memory",
+            "from trusted memory",
+            "from obsidian memory",
+            "local memory test phrase",
+            "blue lantern protocol",
+            "what do you know about",
+        ]
+
+        return any(trigger in cleaned for trigger in triggers)
+
+    def _memory_recall_query_from_text(self, text: str) -> str:
+        """Extract a reasonable trusted-memory search query from a natural question."""
+        cleaned = (text or "").strip()
+        lowered = cleaned.lower()
+
+        # Normalize common typos before extracting the search query.
+        lowered = lowered.replace("memort", "memory")
+        lowered = lowered.replace("memeory", "memory")
+        lowered = lowered.replace("remeber", "remember")
+        lowered = lowered.replace("rember", "remember")
+
+        replacements = [
+            "what do you remember about",
+            "do you remember",
+            "what do you know about",
+            "search your memory for",
+            "search local memory for",
+            "search trusted memory for",
+            "search obsidian memory for",
+            "from trusted memory",
+            "from obsidian memory",
+            "use local obsidian trusted memory only",
+            "use trusted memory only",
+            "use local memory only",
+        ]
+
+        query = cleaned
+        for phrase in replacements:
+            query = query.replace(phrase, "", 1)
+            query = query.replace(phrase.title(), "", 1)
+
+        query = query.replace("?", "").replace("!", "").strip(" :-")
+
+        # Special stable test phrase route.
+        if (
+            "local memory test phrase" in lowered
+            or "local test phrase" in lowered
+            or "test phrase" in lowered
+        ):
+            return "local memory test phrase"
+
+        if "blue lantern protocol" in lowered:
+            return "blue lantern protocol"
+
+        return query or cleaned
+
+    async def _handle_natural_memory_recall(self, msg: "Message") -> None:
+        """Search trusted Obsidian memory for a natural-language recall question."""
+        raw_text = self._clean_bot_trigger_text(msg.text or "").strip()
+        query = self._memory_recall_query_from_text(raw_text)
+
+        helper = "/mnt/hermes-data/eva/scripts/eva-vault-read"
+        rc, out, err = await self._run_eva_helper(
+            helper,
+            "search",
+            query,
+            timeout=20.0,
+        )
+
+        if rc != 0:
+            await msg.reply_text(
+                "🧠 I tried to search trusted Obsidian memory, but the helper failed.\n\n"
+                f"{err or out or 'Unknown error.'}\n\n"
+                "So no, I am not going to pretend I remembered it. Tiny standards, still standards."
+            )
+            return
+
+        lines = []
+        for line in (out or "").strip().splitlines():
+            clean = line.strip()
+            if not clean:
+                continue
+            if clean.lower().startswith("searching approved markdown notes for:"):
+                continue
+            lines.append(clean)
+
+        if not lines:
+            await msg.reply_text(
+                "🧠 I searched trusted Obsidian memory and found nothing matching that.\n\n"
+                f"Search used: {query}\n\n"
+                "No fake memory today. Tragic, but hygienic."
+            )
+            return
+
+        result = "\n".join(lines)
+
+        # If the line contains the blue lantern answer, answer cleanly.
+        if "blue lantern protocol" in result.lower():
+            await msg.reply_text(
+                "🧠 I found it in trusted Obsidian memory.\n\n"
+                "Eva’s local memory test phrase is: blue lantern protocol.\n\n"
+                "Source:\n"
+                f"{result}"
+            )
+            return
+
+        max_len = 3000
+        if len(result) > max_len:
+            result = result[:max_len] + "\n\n...truncated."
+
+        await msg.reply_text(
+            "🧠 I found this in trusted Obsidian memory.\n\n"
+            f"{result}"
+        )
+
+    def _memory_suggestion_candidate_from_text(self, text: str) -> Optional[str]:
+        """Return a memory candidate when a message looks durable enough to ask about."""
+        raw = (text or "").strip()
+        if not raw:
+            return None
+
+        lowered = raw.lower()
+        compact = " ".join(lowered.split())
+
+        # Do not suggest memory for commands or obvious dumps.
+        if raw.startswith("/"):
+            return None
+        if len(raw) < 8 or len(raw) > 900:
+            return None
+        if raw.count("\n") > 8:
+            return None
+        if "```" in raw or "traceback" in lowered or "exception" in lowered:
+            return None
+        if "eva@" in lowered or "ps c:" in lowered or "git diff" in lowered:
+            return None
+
+        # Refuse obvious sensitive values. Better boring than breached.
+        sensitive_terms = [
+            "password", "token", "api key", "apikey", "secret", ".env",
+            "ssh key", "private key", "credential", "bearer ", "sk-",
+        ]
+        if any(term in lowered for term in sensitive_terms):
+            return None
+
+        strong_triggers = [
+            "going forward",
+            "from now on",
+            "always",
+            "never",
+            "i prefer",
+            "i want you to",
+            "i want her to",
+            "remember that",
+            "for future handoffs",
+            "for future handoff",
+            "in future handoffs",
+            "this is the process",
+            "this should be standard",
+            "standard workflow",
+            "standard process",
+            "add this to the runbook",
+            "add this to our handoff",
+            "include this in the handoff",
+            "make sure eva",
+            "when we program eva",
+            "when programming eva",
+            "this worked",
+            "that worked",
+        ]
+
+        praise_triggers = [
+            "good job",
+            "excellent",
+            "great work",
+            "awesome",
+            "perfect",
+            "nice work",
+            "that is what i wanted",
+            "that's what i wanted",
+            "that was right",
+            "that worked well",
+        ]
+
+        if any(trigger in compact for trigger in strong_triggers):
+            return raw
+
+        if any(trigger in compact for trigger in praise_triggers):
+            return (
+                "Michael gave positive feedback about the current Eva behavior or workflow: "
+                f"{raw}\n\n"
+                "During weekly review, preserve the specific behavior, wording, or process from the recent context only if it is useful long-term."
+            )
+
+        return None
+
+    async def _maybe_offer_memory_suggestion(self, msg: "Message", text: str) -> bool:
+        """Ask Michael before saving a useful-looking memory candidate. Returns True if Eva asked."""
+        candidate = self._memory_suggestion_candidate_from_text(text)
+        if not candidate:
+            return False
+
+        chat_id = str(getattr(msg, "chat_id", ""))
+        if not chat_id:
+            return False
+
+        # Light anti-bloat: do not ask repeatedly for the same normalized candidate.
+        norm = " ".join(candidate.lower().split())[:240]
+        recent = getattr(self, "_memory_suggestion_recent", None)
+        if recent is None:
+            recent = {}
+            self._memory_suggestion_recent = recent
+        if recent.get(chat_id) == norm:
+            return False
+        recent[chat_id] = norm
+
+        next_id = int(getattr(self, "_memory_suggestion_next_id", 0)) + 1
+        self._memory_suggestion_next_id = next_id
+
+        state = getattr(self, "_memory_suggestion_state", None)
+        if state is None:
+            state = {}
+            self._memory_suggestion_state = state
+
+        state[next_id] = {
+            "text": candidate,
+            "title": "Telegram suggested memory",
+            "category": "general",
+        }
+
+        preview = candidate.strip().replace("\n", " ")
+        if len(preview) > 420:
+            preview = preview[:420] + "..."
+
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Remember", callback_data=f"mr:y:{next_id}"),
+                InlineKeyboardButton("❌ Don’t Remember", callback_data=f"mr:n:{next_id}"),
+            ]
+        ])
+
+        await msg.reply_text(
+            "🧠 This might be worth remembering.\n\n"
+            f"Preview:\n“{preview}”\n\n"
+            "Should I save it to Obsidian review?\n"
+            "It will stay untrusted until weekly review.",
+            reply_markup=keyboard,
+        )
+        return True
+
+    async def _handle_memory_suggestion_callback(
+        self,
+        query: "CallbackQuery",
+        data: str,
+        query_chat_id=None,
+        query_chat_type=None,
+        query_thread_id=None,
+        query_user_name=None,
+    ) -> None:
+        """Handle ask-before-remembering buttons."""
+        parts = data.split(":", 2)
+        if len(parts) != 3:
+            await query.answer(text="Invalid memory action.")
+            return
+
+        choice = parts[1]
+        try:
+            suggestion_id = int(parts[2])
+        except ValueError:
+            await query.answer(text="Invalid memory id.")
+            return
+
+        caller_id = str(getattr(query.from_user, "id", ""))
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=query_chat_id,
+            chat_type=str(query_chat_type) if query_chat_type is not None else None,
+            thread_id=str(query_thread_id) if query_thread_id is not None else None,
+            user_name=query_user_name,
+        ):
+            await query.answer(text="⛔ You are not authorized to approve memory.")
+            return
+
+        state = getattr(self, "_memory_suggestion_state", {})
+        item = state.pop(suggestion_id, None)
+        if not item:
+            await query.answer(text="This memory prompt was already resolved.")
+            return
+
+        if choice == "n":
+            await query.answer(text="Not remembered.")
+            try:
+                user_display = getattr(query.from_user, "first_name", "User")
+                await query.edit_message_text(
+                    text=(
+                        "🧠 Not remembered.\n\n"
+                        f"Decision: ❌ Don’t Remember by {user_display}\n\n"
+                        "Got it. I’ll use the feedback for this chat, but I won’t save it long-term. "
+                        "Look at me, respecting boundaries. Weirdly refreshing."
+                    ),
+                    reply_markup=None,
+                )
+            except Exception:
+                pass
+            return
+
+        if choice != "y":
+            await query.answer(text="Unknown memory action.")
+            return
+
+        helper = "/mnt/hermes-data/eva/scripts/eva-vault-capture"
+        rc, out, err = await self._run_eva_helper(
+            helper,
+            item["text"],
+            item.get("title", "Telegram suggested memory"),
+            item.get("category", "general"),
+            timeout=20.0,
+        )
+
+        if rc != 0:
+            await query.answer(text="Memory capture failed.")
+            try:
+                await query.edit_message_text(
+                    text=(
+                        "❌ I could not save that memory candidate.\n\n"
+                        f"{err or out or 'Unknown error.'}\n\n"
+                        "Nothing was trusted or finalized."
+                    ),
+                    reply_markup=None,
+                )
+            except Exception:
+                pass
+            return
+
+        await query.answer(text="Saved for review.")
+        try:
+            user_display = getattr(query.from_user, "first_name", "User")
+            await query.edit_message_text(
+                text=(
+                    "🧠 Saved to Obsidian review.\n\n"
+                    f"Decision: ✅ Remember by {user_display}\n\n"
+                    "Status: candidate\n"
+                    "Trusted: false\n\n"
+                    "I’ll keep this ready for weekly review. Once you approve and finalize it, "
+                    "it can become trusted memory. Until then, it stays in the waiting room like a well-behaved thought.\n\n"
+                    f"{out}"
+                ),
+                reply_markup=None,
+            )
+        except Exception:
+            pass
+
+    async def _handle_eva_commands_command(self, msg: "Message") -> None:
+        """Show Eva custom commands from the Obsidian-backed registry."""
+        raw_text = self._clean_bot_trigger_text(msg.text or "").strip()
+        parts = raw_text.split(maxsplit=1)
+        mode = "full" if len(parts) > 1 and parts[1].strip().lower() in {"full", "all", "registry"} else "telegram"
+
+        helper = "/mnt/hermes-data/eva/scripts/eva-command-list"
+        rc, out, err = await self._run_eva_helper(helper, mode, timeout=20.0)
+
+        if rc != 0:
+            await msg.reply_text(
+                "❌ I couldn't load my custom command registry.\n\n"
+                f"{err or out or 'Unknown error.'}"
+            )
+            return
+
+        text = (out or "").strip()
+        if not text:
+            await msg.reply_text("I found the command registry, but it was empty. Rude little filing cabinet.")
+            return
+
+        header = "📜 My custom commands, straight from the local registry. No guessing, no vibes.\n\n"
+        max_len = 3500
+
+        chunks = []
+        current = header
+
+        for line in text.splitlines():
+            addition = line + "\n"
+            if len(current) + len(addition) > max_len:
+                chunks.append(current.rstrip())
+                current = addition
+            else:
+                current += addition
+
+        if current.strip():
+            chunks.append(current.rstrip())
+
+        total = len(chunks)
+        for idx, chunk in enumerate(chunks, start=1):
+            if total > 1:
+                await msg.reply_text(f"{chunk}\n\nPage {idx}/{total}")
+            else:
+                await msg.reply_text(chunk)
+
+    async def _handle_memory_search_command(self, msg: "Message") -> None:
+        """Search trusted local Obsidian memory through eva-vault-read."""
+        raw_text = self._clean_bot_trigger_text(msg.text or "").strip()
+        parts = raw_text.split(maxsplit=1)
+
+        if len(parts) < 2 or not parts[1].strip():
+            await msg.reply_text(
+                "🔎 Local Memory Search\n\n"
+                "Usage:\n"
+                "/memory_search search text\n\n"
+                "Example:\n"
+                "/memory_search blue lantern protocol\n\n"
+                "This searches approved/trusted Obsidian folders only."
+            )
+            return
+
+        query = parts[1].strip()
+        helper = "/mnt/hermes-data/eva/scripts/eva-vault-read"
+
+        rc, out, err = await self._run_eva_helper(
+            helper,
+            "search",
+            query,
+            timeout=20.0,
+        )
+
+        if rc != 0:
+            await msg.reply_text(
+                "❌ Local memory search failed.\n\n"
+                f"{err or out or 'Unknown error.'}"
+            )
+            return
+
+        if not out.strip():
+            await msg.reply_text(
+                "🔎 Local Memory Search\n\n"
+                "No trusted Obsidian memory matched that search."
+            )
+            return
+
+        lines = []
+        for line in out.strip().splitlines():
+            clean = line.strip()
+            if not clean:
+                continue
+            if clean.lower().startswith("searching approved markdown notes for:"):
+                continue
+            lines.append(clean)
+
+        result = "\n".join(lines).strip()
+
+        if not result:
+            await msg.reply_text(
+                "🔎 I searched trusted memory, but found no matching note.\n\n"
+                "The filing cabinet gave me dust and attitude."
+            )
+            return
+
+        max_len = 3000
+        if len(result) > max_len:
+            result = result[:max_len] + "\n\n...truncated."
+
+        await msg.reply_text(
+            "🔎 Found it in trusted memory.\n\n"
+            f"{result}\n\n"
+            "Tiny miracle: the filing cabinet opened."
+        )
+
+    async def _handle_remember_command(self, msg: "Message") -> None:
+        """Capture a general memory note into Obsidian quarantine for later review."""
+        raw_text = self._clean_bot_trigger_text(msg.text or "").strip()
+        parts = raw_text.split(maxsplit=1)
+
+        if len(parts) < 2 or not parts[1].strip():
+            await msg.reply_text(
+                "🧠 General Memory Capture\n\n"
+                "Usage:\n"
+                "/remember thing to remember\n\n"
+                "Example:\n"
+                "/remember Eva should ask before saving long-term memory into Obsidian.\n\n"
+                "This only captures a review note. It does not become trusted memory until approved and finalized."
+            )
+            return
+
+        memory_text = parts[1].strip()
+
+        helper = "/mnt/hermes-data/eva/scripts/eva-vault-capture"
+        title = "Telegram memory capture"
+        category = "general"
+
+        rc, out, err = await self._run_eva_helper(
+            helper,
+            memory_text,
+            title,
+            category,
+            timeout=20.0,
+        )
+
+        if rc != 0:
+            await msg.reply_text(
+                "❌ General memory was not captured.\n\n"
+                f"{err or out or 'Unknown error.'}\n\n"
+                "Nothing was trusted or finalized."
+            )
+            return
+
+        await msg.reply_text(
+            "🧠 General Memory Captured for Review\n\n"
+            "Status: candidate\n"
+            "Trusted: false\n\n"
+            "I saved this to the Obsidian review inbox.\n"
+            "It is not trusted memory yet.\n\n"
+            "Use /weekly_review to preview and approve it.\n\n"
+            f"{out}"
+        )
+
+    async def _handle_remember_person_command(self, msg: "Message") -> None:
+        """Capture a person-memory note into Obsidian quarantine for later review."""
+        raw_text = self._clean_bot_trigger_text(msg.text or "").strip()
+        parts = raw_text.split(maxsplit=2)
+
+        if len(parts) < 3:
+            await msg.reply_text(
+                "🧠 People Memory Capture\n\n"
+                "Usage:\n"
+                "/remember_person Michael thing to remember\n\n"
+                "Allowed people: Michael, Belinda, Unknown\n\n"
+                "Example:\n"
+                "/remember_person Michael Michael prefers step-by-step commands.\n\n"
+                "This only captures a review note. It does not become trusted memory until approved."
+            )
+            return
+
+        _, person, memory_text = parts
+        person = person.strip()
+        memory_text = memory_text.strip()
+
+        if person not in {"Michael", "Belinda", "Unknown"}:
+            await msg.reply_text(
+                "❌ Invalid person.\n\n"
+                "Use one of:\n"
+                "Michael\n"
+                "Belinda\n"
+                "Unknown"
+            )
+            return
+
+        if not memory_text:
+            await msg.reply_text("❌ Nothing to remember was provided.")
+            return
+
+        helper = "/mnt/hermes-data/eva/scripts/eva-vault-capture-person"
+        title = "Telegram memory capture"
+
+        rc, out, err = await self._run_eva_helper(
+            helper,
+            person,
+            memory_text,
+            title,
+            timeout=20.0,
+        )
+
+        if rc != 0:
+            await msg.reply_text(
+                "❌ People memory was not captured.\n\n"
+                f"{err or out or 'Unknown error.'}\n\n"
+                "Nothing was trusted or finalized."
+            )
+            return
+
+        await msg.reply_text(
+            "🧠 People Memory Captured for Review\n\n"
+            f"Person: {person}\n"
+            "Status: needs_review\n\n"
+            "I saved this to the Obsidian review inbox.\n"
+            "It is not trusted memory yet.\n\n"
+            "Use /weekly_review to preview and approve it.\n\n"
+            f"{out}"
+        )
+
+
+    async def _handle_monthly_check_command(self, msg: "Message") -> None:
+        """Run Eva's read-only monthly maintenance check and return the clean summary."""
+        helper = "/mnt/hermes-data/eva/scripts/eva-monthly-check.sh"
+
+        rc, out, err = await self._run_eva_helper(
+            helper,
+            "--summary",
+            timeout=90.0,
+        )
+
+        if rc != 0:
+            await msg.reply_text(
+                "❌ Monthly maintenance check failed.\n\n"
+                f"{err or out or 'Unknown error.'}\n\n"
+                "I did not install updates, restart services, reboot, delete files, or quarantine anything."
+            )
+            return
+
+        text = (out or "").strip()
+        if not text:
+            await msg.reply_text(
+                "🛠 Monthly maintenance check finished, but the report came back empty.\n\n"
+                "That is not useful. Tiny machine bureaucracy has been detected."
+            )
+            return
+
+        max_len = 3500
+        chunks = []
+        current = ""
+
+        for line in text.splitlines():
+            addition = line + "\n"
+            if len(current) + len(addition) > max_len:
+                chunks.append(current.rstrip())
+                current = addition
+            else:
+                current += addition
+
+        if current.strip():
+            chunks.append(current.rstrip())
+
+        total = len(chunks)
+        for idx, chunk in enumerate(chunks, start=1):
+            if total > 1:
+                await msg.reply_text(f"{chunk}\n\nPage {idx}/{total}")
+            else:
+                await msg.reply_text(chunk)
+
+    async def _handle_eva_custom_command(self, msg: "Message", command: str) -> None:
+        """Dispatch Eva custom commands that bypass the normal agent path."""
+        if command == "/eva_commands":
+            await self._handle_eva_commands_command(msg)
+            return
+        if command == "/memory_search":
+            await self._handle_memory_search_command(msg)
+            return
+        if command == "/remember":
+            await self._handle_remember_command(msg)
+            return
+        if command == "/remember_person":
+            await self._handle_remember_person_command(msg)
+            return
+        if command == "/monthly_check":
+            await self._handle_monthly_check_command(msg)
+            return
+        await msg.reply_text("Unknown Eva custom command.")
+
+    async def _handle_weekly_review_command(self, msg: "Message") -> None:
+        """Handle /weekly_review commands directly in Telegram."""
+        chat_id = getattr(msg, "chat_id", None)
+        if chat_id is None:
+            return
+
+        thread_id = getattr(msg, "message_thread_id", None)
+        text = (getattr(msg, "text", "") or "").strip()
+        command = text.split()[0].split("@", 1)[0].lower() if text else ""
+
+        if command in {"/weekly_review", "/weekly_review_start"}:
+            await self._wr_send_or_edit_review(
+                chat_id=chat_id,
+                message_thread_id=thread_id,
+                started=True,
+            )
+            return
+
+        if command == "/weekly_review_status":
+            rc, out, err = await self._wr_run("status", timeout=20.0)
+            message = (
+                "🧠 Eva Memory Review Status\n\n"
+                + (out if rc == 0 else (err or out or "Status failed."))
+            )
+            kwargs = {"chat_id": chat_id, "text": message[:3900]}
+            if thread_id is not None:
+                kwargs["message_thread_id"] = thread_id
+            await self._bot.send_message(**kwargs)
+            return
+
+    async def _handle_weekly_review_callback(
+        self,
+        query: Any,
+        data: str,
+        *,
+        query_chat_id: Any = None,
+        query_chat_type: Optional[str] = None,
+        query_thread_id: Any = None,
+        query_user_name: Optional[str] = None,
+    ) -> None:
+        """Handle weekly-review inline button callbacks (wr:*)."""
+        caller_id = str(getattr(query.from_user, "id", ""))
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=query_chat_id,
+            chat_type=str(query_chat_type) if query_chat_type is not None else None,
+            thread_id=str(query_thread_id) if query_thread_id is not None else None,
+            user_name=query_user_name,
+        ):
+            await query.answer(text="⛔ You are not authorized to approve Eva memory notes.")
+            return
+
+        parts = data.split(":")
+        action = parts[1] if len(parts) > 1 else ""
+
+        try:
+            chat_id = int(query_chat_id) if query_chat_id is not None else int(query.message.chat_id)
+        except Exception:
+            await query.answer(text="Could not determine chat.")
+            return
+
+        if action == "s":
+            await query.answer(text="Refreshing review list.")
+            await self._wr_send_or_edit_review(
+                chat_id=chat_id,
+                message_thread_id=query_thread_id,
+                query=query,
+                started=False,
+            )
+            return
+
+        if action == "p" and len(parts) >= 3:
+            note_num = parts[2]
+            rc, out, err = await self._wr_run("preview", note_num, timeout=20.0)
+            text = out if rc == 0 else (err or out or "Preview failed.")
+            if len(text) > 3500:
+                text = text[:3500] + "\n\n...preview trimmed because Telegram is tiny and dramatic."
+            await query.answer(text="Preview opened.")
+            await query.message.reply_text(f"👀 Eva Memory Preview\n\n{text}")
+            return
+
+        if action == "a" and len(parts) >= 4:
+            note_num = parts[2]
+            note_type = parts[3]
+            if note_type not in {"runbook", "decision", "troubleshooting", "daily", "person"}:
+                await query.answer(text="Invalid approval type.")
+                return
+            rc, out, err = await self._wr_run("approve", note_num, note_type, timeout=20.0)
+            if rc == 0:
+                await query.answer(text=f"✅ Approved as {note_type}.")
+                await query.message.reply_text(
+                    f"✅ Approved note {note_num} as {note_type}.\n\n"
+                    "I moved it into the weekly approved holding folder. "
+                    "It still is not trusted memory until you finalize. Safety theater, except useful."
+                )
+                await self._wr_send_or_edit_review(
+                    chat_id=chat_id,
+                    message_thread_id=query_thread_id,
+                    query=query,
+                    started=False,
+                )
+            else:
+                await query.answer(text="Approval failed.")
+                await query.message.reply_text(f"⚠️ Approval failed:\n\n{err or out}")
+            return
+
+        if action == "d" and len(parts) >= 3:
+            note_num = parts[2]
+            rc, out, err = await self._wr_run("deny", note_num, timeout=20.0)
+            if rc == 0:
+                await query.answer(text="🗄 Archived.")
+                await query.message.reply_text(
+                    f"🗄 Archived note {note_num}.\n\n"
+                    "I moved it out of the review queue. The vault remains tidy, which is rare and worth celebrating quietly."
+                )
+                await self._wr_send_or_edit_review(
+                    chat_id=chat_id,
+                    message_thread_id=query_thread_id,
+                    query=query,
+                    started=False,
+                )
+            else:
+                await query.answer(text="Deny failed.")
+                await query.message.reply_text(f"⚠️ Deny failed:\n\n{err or out}")
+            return
+
+        if action == "f":
+            await query.answer(text="Finalizing. Backup runs first.")
+            rc, out, err = await self._wr_run("finalize", timeout=90.0)
+            if rc == 0:
+                await query.message.reply_text(
+                    "📦 Finalize complete.\n\n"
+                    "I created a backup first, then promoted approved notes into the trusted vault folders.\n"
+                    "Action log updated. No overwrites. No secrets touched. No chaos unleashed."
+                )
+                await self._wr_send_or_edit_review(
+                    chat_id=chat_id,
+                    message_thread_id=query_thread_id,
+                    query=query,
+                    started=False,
+                )
+            else:
+                await query.message.reply_text(f"⚠️ Finalize failed:\n\n{err or out}")
+            return
+
+        await query.answer(text="Unknown weekly-review action.")
+
+
     async def _handle_callback_query(
         self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
     ) -> None:
@@ -3249,6 +4241,30 @@ class TelegramAdapter(BasePlatformAdapter):
             chat_id = str(query.message.chat_id) if query.message else None
             if chat_id:
                 await self._handle_model_picker_callback(query, data, chat_id)
+            return
+
+        # --- Memory suggestion callbacks (mr:choice:id) ---
+        if data.startswith("mr:"):
+            await self._handle_memory_suggestion_callback(
+                query,
+                data,
+                query_chat_id=query_chat_id,
+                query_chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                query_thread_id=query_thread_id,
+                query_user_name=query_user_name,
+            )
+            return
+
+        # --- Weekly-review callbacks (wr:action:args) ---
+        if data.startswith("wr:"):
+            await self._handle_weekly_review_callback(
+                query,
+                data,
+                query_chat_id=query_chat_id,
+                query_chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                query_thread_id=query_thread_id,
+                query_user_name=query_user_name,
+            )
             return
 
         # --- Gmail-triage callbacks (gt:verb:arg) ---
@@ -5196,6 +6212,21 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         await self._ensure_forum_commands(update.message)
 
+        cleaned_text = self._clean_bot_trigger_text(msg.text or "").strip()
+        if self._is_custom_commands_question(cleaned_text):
+            await self._handle_eva_commands_command(msg)
+            return
+
+        if self._is_memory_recall_question(cleaned_text):
+            await self._handle_natural_memory_recall(msg)
+            return
+
+        try:
+            if await self._maybe_offer_memory_suggestion(msg, cleaned_text):
+                return
+        except Exception as exc:
+            logger.warning("[Telegram] Memory suggestion offer failed: %s", exc, exc_info=True)
+
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
         event = self._apply_telegram_group_observe_attribution(event)
@@ -5209,6 +6240,15 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._should_process_message(msg, is_command=True):
             return
         await self._ensure_forum_commands(msg)
+
+        cleaned_command = self._clean_bot_trigger_text(msg.text or "").strip().split()[0].split("@", 1)[0].lower() if msg.text else ""
+        if cleaned_command in {"/weekly_review", "/weekly_review_start", "/weekly_review_status"}:
+            await self._handle_weekly_review_command(msg)
+            return
+
+        if cleaned_command in {"/eva_commands", "/memory_search", "/remember", "/remember_person", "/monthly_check"}:
+            await self._handle_eva_custom_command(msg, cleaned_command)
+            return
 
         event = self._build_message_event(msg, MessageType.COMMAND, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
