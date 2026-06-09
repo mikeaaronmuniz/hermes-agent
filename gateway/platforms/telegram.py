@@ -4054,6 +4054,52 @@ class TelegramAdapter(BasePlatformAdapter):
             else:
                 await msg.reply_text(chunk)
 
+    async def _handle_os_update_check_command(self, msg: "Message") -> None:
+        """Run Eva's read-only OS update check and return the clean summary."""
+        rc, out, err = await self._run_eva_helper(
+            "/mnt/hermes-data/eva/scripts/eva-os-update-check.sh",
+            "summary",
+            timeout=90.0,
+        )
+
+        if rc != 0:
+            await msg.reply_text(
+                "❌ OS update check failed.\n\n"
+                f"{err or out or 'Unknown error.'}\n\n"
+                "I did not install updates, change packages, restart services, use sudo, or reboot."
+            )
+            return
+
+        report_text = (out or "").strip()
+        if not report_text:
+            await msg.reply_text(
+                "🧩 OS update check finished, but the report came back empty.\n\n"
+                "That is not useful. The package gremlins are withholding paperwork."
+            )
+            return
+
+        max_len = 3500
+        chunks = []
+        current = ""
+
+        for line in report_text.splitlines():
+            addition = line + "\n"
+            if len(current) + len(addition) > max_len:
+                chunks.append(current.rstrip())
+                current = addition
+            else:
+                current += addition
+
+        if current.strip():
+            chunks.append(current.rstrip())
+
+        total = len(chunks)
+        for idx, chunk in enumerate(chunks, start=1):
+            if total > 1:
+                await msg.reply_text(f"{chunk}\n\nPage {idx}/{total}")
+            else:
+                await msg.reply_text(chunk)
+
     async def _handle_eva_custom_command(self, msg: "Message", command: str) -> None:
         """Dispatch Eva custom commands that bypass the normal agent path."""
         if command == "/eva_commands":
@@ -4070,6 +4116,9 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         if command == "/monthly_check":
             await self._handle_monthly_check_command(msg)
+            return
+        if command == "/os_update_check":
+            await self._handle_os_update_check_command(msg)
             return
         await msg.reply_text("Unknown Eva custom command.")
 
@@ -6246,7 +6295,7 @@ class TelegramAdapter(BasePlatformAdapter):
             await self._handle_weekly_review_command(msg)
             return
 
-        if cleaned_command in {"/eva_commands", "/memory_search", "/remember", "/remember_person", "/monthly_check"}:
+        if cleaned_command in {"/eva_commands", "/memory_search", "/remember", "/remember_person", "/monthly_check", "/os_update_check"}:
             await self._handle_eva_custom_command(msg, cleaned_command)
             return
 
