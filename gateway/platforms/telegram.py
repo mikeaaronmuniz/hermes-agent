@@ -4102,6 +4102,31 @@ class TelegramAdapter(BasePlatformAdapter):
 
         await msg.reply_text(report_text)
 
+    async def _handle_firmware_status_command(self, msg: "Message") -> None:
+        """Return Eva's concise read-only firmware status."""
+        rc, out, err = await self._run_eva_helper(
+            "/mnt/hermes-data/eva/scripts/eva-firmware-status",
+            timeout=30.0,
+        )
+
+        if rc != 0:
+            await msg.reply_text(
+                "❌ Firmware status check failed.\n\n"
+                f"{err or out or 'Unknown error.'}\n\n"
+                "I did not install firmware, refresh metadata, use sudo, restart services, or reboot."
+            )
+            return
+
+        report_text = (out or "").strip()
+        if not report_text:
+            await msg.reply_text(
+                "🧬 Firmware status check finished, but the summary came back empty.\n\n"
+                "No firmware action was taken."
+            )
+            return
+
+        await msg.reply_text(report_text)
+
     async def _handle_eva_custom_command(self, msg: "Message", command: str) -> None:
         """Dispatch Eva custom commands that bypass the normal agent path."""
         if command == "/eva_commands":
@@ -4124,6 +4149,9 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         if command == "/deep_scan_status":
             await self._handle_deep_scan_status_command(msg)
+            return
+        if command == "/firmware_status":
+            await self._handle_firmware_status_command(msg)
             return
         await msg.reply_text("Unknown Eva custom command.")
 
@@ -6300,7 +6328,7 @@ class TelegramAdapter(BasePlatformAdapter):
             await self._handle_weekly_review_command(msg)
             return
 
-        if cleaned_command in {"/eva_commands", "/memory_search", "/remember", "/remember_person", "/monthly_check", "/os_update_check", "/deep_scan_status"}:
+        if cleaned_command in {"/eva_commands", "/memory_search", "/remember", "/remember_person", "/monthly_check", "/os_update_check", "/deep_scan_status", "/firmware_status"}:
             await self._handle_eva_custom_command(msg, cleaned_command)
             return
 
