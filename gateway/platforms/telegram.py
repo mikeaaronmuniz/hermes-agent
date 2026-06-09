@@ -4007,52 +4007,29 @@ class TelegramAdapter(BasePlatformAdapter):
 
 
     async def _handle_monthly_check_command(self, msg: "Message") -> None:
-        """Run Eva's read-only monthly maintenance check and return the clean summary."""
-        helper = "/mnt/hermes-data/eva/scripts/eva-monthly-check.sh"
-
+        """Run Eva's read-only monthly maintenance check and return a concise Telegram summary."""
         rc, out, err = await self._run_eva_helper(
-            helper,
-            "--summary",
+            "/mnt/hermes-data/eva/scripts/eva-monthly-telegram-summary",
             timeout=90.0,
         )
 
         if rc != 0:
             await msg.reply_text(
-                "❌ Monthly maintenance check failed.\n\n"
+                "❌ Monthly maintenance summary failed.\n\n"
                 f"{err or out or 'Unknown error.'}\n\n"
                 "I did not install updates, restart services, reboot, delete files, or quarantine anything."
             )
             return
 
-        text = (out or "").strip()
-        if not text:
+        report_text = (out or "").strip()
+        if not report_text:
             await msg.reply_text(
-                "🛠 Monthly maintenance check finished, but the report came back empty.\n\n"
-                "That is not useful. Tiny machine bureaucracy has been detected."
+                "🛠 Monthly maintenance summary finished, but the report came back empty.\n\n"
+                "No maintenance actions were started."
             )
             return
 
-        max_len = 3500
-        chunks = []
-        current = ""
-
-        for line in text.splitlines():
-            addition = line + "\n"
-            if len(current) + len(addition) > max_len:
-                chunks.append(current.rstrip())
-                current = addition
-            else:
-                current += addition
-
-        if current.strip():
-            chunks.append(current.rstrip())
-
-        total = len(chunks)
-        for idx, chunk in enumerate(chunks, start=1):
-            if total > 1:
-                await msg.reply_text(f"{chunk}\n\nPage {idx}/{total}")
-            else:
-                await msg.reply_text(chunk)
+        await msg.reply_text(report_text)
 
     async def _handle_os_update_check_command(self, msg: "Message") -> None:
         """Run Eva's read-only OS update check and return the clean summary."""
