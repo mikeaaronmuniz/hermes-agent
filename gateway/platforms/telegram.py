@@ -4152,6 +4152,31 @@ class TelegramAdapter(BasePlatformAdapter):
 
         await msg.reply_text(report_text)
 
+    async def _handle_model_status_command(self, msg: "Message") -> None:
+        """Return Eva's concise read-only local AI model status."""
+        rc, out, err = await self._run_eva_helper(
+            "/mnt/hermes-data/eva/scripts/eva-model-status",
+            timeout=45.0,
+        )
+
+        if rc != 0:
+            await msg.reply_text(
+                "🧠 Model status check failed.\n\n"
+                f"{err or out or 'No details returned.'}\n\n"
+                "No models were pulled, removed, changed, and no services were restarted."
+            )
+            return
+
+        report_text = (out or "").strip()
+        if not report_text:
+            await msg.reply_text(
+                "🧠 Model status check finished, but the summary came back empty.\n\n"
+                "No models were pulled, removed, changed, and no services were restarted."
+            )
+            return
+
+        await msg.reply_text(report_text)
+
     async def _handle_eva_custom_command(self, msg: "Message", command: str) -> None:
         """Dispatch Eva custom commands that bypass the normal agent path."""
         if command == "/eva_commands":
@@ -4180,6 +4205,9 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         if command == "/approval_queue":
             await self._handle_approval_queue_command(msg)
+            return
+        if command == "/model_status":
+            await self._handle_model_status_command(msg)
             return
         await msg.reply_text("Unknown Eva custom command.")
 
@@ -6356,7 +6384,7 @@ class TelegramAdapter(BasePlatformAdapter):
             await self._handle_weekly_review_command(msg)
             return
 
-        if cleaned_command in {"/eva_commands", "/memory_search", "/remember", "/remember_person", "/monthly_check", "/os_update_check", "/deep_scan_status", "/firmware_status", "/approval_queue"}:
+        if cleaned_command in {"/eva_commands", "/memory_search", "/remember", "/remember_person", "/monthly_check", "/os_update_check", "/deep_scan_status", "/firmware_status", "/approval_queue", "/model_status"}:
             await self._handle_eva_custom_command(msg, cleaned_command)
             return
 
